@@ -1,4 +1,3 @@
 ---
-manufacturers:
-  - Arista
-  - Cisco
+- name: Arista
+- name: Cisco

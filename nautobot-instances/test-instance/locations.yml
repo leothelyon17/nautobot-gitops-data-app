@@ -1,4 +1,4 @@
 ---
 - name: test location
-  location_type: site
+  location_type: lab
   status: Active

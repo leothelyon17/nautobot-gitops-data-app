@@ -4,6 +4,7 @@ import yaml
 import requests
 import os
 import tempfile
+import time
 from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -41,8 +42,7 @@ class NautobotClient:
         self.session.headers["Authorization"] = f"Token {self._token}"
         if self.proxies:
             self.session.proxies.update(self.proxies)
-        retry_method = Retry(total=self.retries, backoff_factor=1, 
-                             status_forcelist=[429, 500, 502, 503, 504])
+        retry_method = Retry(total=self.retries, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         adapter = HTTPAdapter(max_retries=retry_method)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
@@ -75,7 +75,7 @@ class Console:
             st.error(message)
         elif style == "warning":
             st.warning(message)
-        elif style == "success":
+        elif style in ("success", "imported"):
             st.success(message)
         else:
             st.info(message)
@@ -94,6 +94,7 @@ def check_and_compare_objects(nautobot_token: str, git_repo_url: str, subdirecto
         "locations.yml": {"endpoint": "/api/dcim/locations/?limit=0", "object_type": "Locations", "compare_key": "name"},
         "location_types.yml": {"endpoint": "/api/dcim/location-types/?limit=0", "object_type": "Location Types", "compare_key": "name"},
         "statuses.yml": {"endpoint": "/api/extras/statuses/?limit=0", "object_type": "Statuses", "compare_key": "name"},
+        "prefixes.yml": {"endpoint": "/api/ipam/prefixes/?limit=0", "object_type": "Prefixes", "compare_key": "prefix"},
         "devices.yml": {"endpoint": "/api/dcim/devices/?limit=0", "object_type": "Devices", "compare_key": "name"},
     }
     found_files = {}
@@ -156,7 +157,6 @@ def check_and_compare_objects(nautobot_token: str, git_repo_url: str, subdirecto
 # =============================
 def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirectory: str,
                               nautobot_url: str = "http://localhost:8080"):
-    # Process in dependency order.
     console.log(f"Cloning repository: {git_repo_url}", style="info")
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
@@ -164,21 +164,34 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
         except Exception as e:
             console.log(f"Error cloning repository: {e}", style="error")
             return
-        # Independent objects.
+        # Define independent files in creation order.
         independent_files = {
             "roles.yml": {"endpoint": "/api/extras/roles/", "object_type": "Roles", "special": False, "compare_key": "name"},
             "manufacturers.yml": {"endpoint": "/api/dcim/manufacturers/", "object_type": "Manufacturers", "special": False, "compare_key": "name"},
             "location_types.yml": {"endpoint": "/api/dcim/location-types/", "object_type": "Location Types", "special": False, "compare_key": "name"},
             "statuses.yml": {"endpoint": "/api/extras/statuses/", "object_type": "Statuses", "special": False, "compare_key": "name"},
+            "prefixes.yml": {"endpoint": "/api/ipam/prefixes/", "object_type": "Prefixes", "special": "prefixes", "compare_key": "prefix"},
         }
+        # Dependent files.
         dependent_files = {
             "device_types.yml": {"endpoint": "/api/dcim/device-types/", "object_type": "Device Types", "special": "device_types", "compare_key": "model"},
             "locations.yml": {"endpoint": "/api/dcim/locations/", "object_type": "Locations", "special": "locations", "compare_key": "name"},
             "devices.yml": {"endpoint": "/api/dcim/devices/", "object_type": "Devices", "special": "devices", "compare_key": "name"},
         }
         nautobot_client = NautobotClient(url=nautobot_url, token=nautobot_token)
+        # Pre-fetch lookup for IPAM namespaces.
+        namespaces_lookup = {}
+        try:
+            response = nautobot_client.http_call(method="get", url="/api/ipam/namespaces/?limit=0")
+            for ns in response.get("results", []):
+                if ns.get("name"):
+                    namespaces_lookup[ns["name"]] = ns.get("id")
+        except Exception as e:
+            console.log(f"Error retrieving namespaces for lookup: {e}", style="error")
         # Process independent objects.
-        for filename, info in independent_files.items():
+        independent_order = ["roles.yml", "manufacturers.yml", "location_types.yml", "statuses.yml", "prefixes.yml"]
+        for filename in independent_order:
+            info = independent_files.get(filename)
             file_path = os.path.join(temp_dir, subdirectory.strip("/"), filename)
             if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
                 console.log(f"{filename} not found or empty; skipping.", style="warning")
@@ -205,48 +218,65 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                     continue
                 if obj.get(info["compare_key"]) in existing_set:
                     continue
-                payload = obj
+                if info.get("special") == "prefixes":
+                    if not all(k in obj for k in ["prefix", "namespace", "type", "status"]):
+                        console.log("Skipping invalid prefix entry; must include 'prefix', 'namespace', 'type', and 'status'.", style="warning")
+                        continue
+                    ns_name = obj.get("namespace")
+                    ns_id = namespaces_lookup.get(ns_name)
+                    if not ns_id:
+                        console.log(f"Namespace '{ns_name}' not found; skipping prefix {obj.get('prefix')}.", style="error")
+                        continue
+                    prefix_type = obj.get("type")
+                    if prefix_type:
+                        prefix_type = prefix_type.lower()
+                    try:
+                        resp_status = nautobot_client.http_call(method="get", url="/api/extras/statuses/?limit=0")
+                        statuses = resp_status.get("results", [])
+                        statuses_lookup = {s.get("name"): s.get("id") for s in statuses if s.get("name")}
+                        status_id = statuses_lookup.get(obj.get("status"))
+                    except Exception as e:
+                        console.log(f"Error retrieving statuses for prefix lookup: {e}", style="error")
+                        status_id = None
+                    if not status_id:
+                        console.log(f"Status '{obj.get('status')}' not found; skipping prefix {obj.get('prefix')}.", style="error")
+                        continue
+                    payload = {"prefix": obj.get("prefix"), "namespace": {"id": ns_id}, "type": prefix_type, "status": {"id": status_id}}
+                else:
+                    payload = obj
                 try:
                     result = nautobot_client.http_call(method="post", url=info["endpoint"], json_data=payload)
-                    display_val = result.get("display") or payload.get("name")
-                    console.log(f"Imported {info['object_type'][:-1]}: {display_val}", style="success")
+                    label = "Prefix" if info["object_type"] == "Prefixes" else info["object_type"][:-1]
+                    display_val = result.get("display") or payload.get("name") or payload.get("prefix")
+                    console.log(f"Imported {label}: {display_val}", style="success")
                 except Exception as e:
                     console.log(f"Error importing {info['object_type'][:-1]} '{payload.get(info['compare_key'])}': {e}", style="error")
         # Refresh independent lookups.
-        roles_lookup = {}
         try:
             response = nautobot_client.http_call(method="get", url="/api/extras/roles/?limit=0")
-            for r in response.get("results", []):
-                if r.get("name"):
-                    roles_lookup[r["name"]] = r.get("id")
+            roles_lookup = {r.get("name"): r.get("id") for r in response.get("results", []) if r.get("name")}
         except Exception as e:
             console.log(f"Error retrieving roles for lookup: {e}", style="error")
-        manufacturers_lookup = {}
+            roles_lookup = {}
         try:
             response = nautobot_client.http_call(method="get", url="/api/dcim/manufacturers/?limit=0")
-            for m in response.get("results", []):
-                if m.get("name"):
-                    manufacturers_lookup[m["name"]] = m.get("id")
+            manufacturers_lookup = {m.get("name"): m.get("id") for m in response.get("results", []) if m.get("name")}
         except Exception as e:
             console.log(f"Error retrieving manufacturers for lookup: {e}", style="error")
-        location_types_lookup = {}
+            manufacturers_lookup = {}
         try:
             response = nautobot_client.http_call(method="get", url="/api/dcim/location-types/?limit=0")
-            for lt in response.get("results", []):
-                if lt.get("name"):
-                    location_types_lookup[lt["name"]] = lt.get("id")
+            location_types_lookup = {lt.get("name"): lt.get("id") for lt in response.get("results", []) if lt.get("name")}
         except Exception as e:
             console.log(f"Error retrieving location types for lookup: {e}", style="error")
-        statuses_lookup = {}
+            location_types_lookup = {}
         try:
             response = nautobot_client.http_call(method="get", url="/api/extras/statuses/?limit=0")
-            for s in response.get("results", []):
-                if s.get("name"):
-                    statuses_lookup[s["name"]] = s.get("id")
+            statuses_lookup = {s.get("name"): s.get("id") for s in response.get("results", []) if s.get("name")}
         except Exception as e:
             console.log(f"Error retrieving statuses for lookup: {e}", style="error")
-        # Process dependent objects.
-        # Device Types
+            statuses_lookup = {}
+        # Process dependent objects: Device Types.
         for filename, info in dependent_files.items():
             if filename != "device_types.yml":
                 continue
@@ -295,15 +325,13 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                 except Exception as e:
                     console.log(f"Error importing device type '{payload.get('model')}': {e}", style="error")
         # Refresh device types lookup.
-        device_types_lookup = {}
         try:
             response = nautobot_client.http_call(method="get", url="/api/dcim/device-types/?limit=0")
-            for dt in response.get("results", []):
-                if dt.get("model"):
-                    device_types_lookup[dt["model"]] = dt.get("id")
+            device_types_lookup = {dt.get("model"): dt.get("id") for dt in response.get("results", []) if dt.get("model")}
         except Exception as e:
             console.log(f"Error retrieving device types for lookup: {e}", style="error")
-        # Locations
+            device_types_lookup = {}
+        # Process dependent objects: Locations.
         for filename, info in dependent_files.items():
             if filename != "locations.yml":
                 continue
@@ -353,15 +381,13 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                 except Exception as e:
                     console.log(f"Error importing location '{payload.get('name')}': {e}", style="error")
         # Refresh locations lookup.
-        locations_lookup = {}
         try:
             response = nautobot_client.http_call(method="get", url="/api/dcim/locations/?limit=0")
-            for l in response.get("results", []):
-                if l.get("name"):
-                    locations_lookup[l["name"]] = l.get("id")
+            locations_lookup = {l.get("name"): l.get("id") for l in response.get("results", []) if l.get("name")}
         except Exception as e:
             console.log(f"Error retrieving locations for lookup: {e}", style="error")
-        # Devices
+            locations_lookup = {}
+        # Process dependent objects: Devices.
         for filename, info in dependent_files.items():
             if filename != "devices.yml":
                 continue
@@ -411,6 +437,9 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                     if not device_type_id:
                         console.log(f"Device type '{obj.get('device-type')}' not found; skipping device {obj.get('name')}.", style="error")
                         continue
+                    # Capture primary_ip4 if provided.
+                    primary_ip_address = obj.get("primary_ip4")
+                    primary_ip_id = None
                     payload = {
                         "name": obj.get("name"),
                         "role": {"id": role_id},
@@ -418,12 +447,85 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                         "location": {"id": location_id},
                         "device_type": {"id": device_type_id},
                     }
+                    interfaces = obj.get("interfaces") if isinstance(obj.get("interfaces"), list) else []
                 else:
                     payload = obj
                 try:
                     result = nautobot_client.http_call(method="post", url=info["endpoint"], json_data=payload)
                     display_val = result.get("display") or payload.get("name")
                     console.log(f"Imported Device: {display_val}", style="success")
+                    # Process interfaces if present.
+                    if info["special"] == "devices" and interfaces:
+                        device_id = result.get("id")
+                        for interface in interfaces:
+                            if not isinstance(interface, dict) or "name" not in interface or "status" not in interface:
+                                console.log("Skipping invalid interface entry; must include 'name' and 'status'.", style="warning")
+                                continue
+                            iface_status_id = statuses_lookup.get(interface["status"])
+                            if not iface_status_id:
+                                console.log(f"Interface status '{interface['status']}' not found; skipping interface {interface.get('name')}.", style="error")
+                                continue
+                            payload_iface = {
+                                "device": {"id": device_id},
+                                "name": interface.get("name"),
+                                "type": interface.get("type"),
+                                "status": {"id": iface_status_id},
+                            }
+                            if interface.get("mgmt_only") is True:
+                                payload_iface["mgmt_only"] = True
+                            try:
+                                iface_result = nautobot_client.http_call(method="post", url="/api/dcim/interfaces/", json_data=payload_iface)
+                                iface_display = iface_result.get("display") or payload_iface.get("name")
+                                console.log(f"Imported Interface: {iface_display}", style="success")
+                                # Process IP addresses for this interface.
+                                if "ip-address" in interface and isinstance(interface["ip-address"], list):
+                                    for ip_obj in interface["ip-address"]:
+                                        if not isinstance(ip_obj, dict) or not ip_obj.get("address"):
+                                            console.log("Skipping invalid ip-address entry; must include 'address'.", style="warning")
+                                            continue
+                                        if not all(k in ip_obj for k in ["address", "namespace", "type", "status"]):
+                                            console.log("Skipping invalid ip-address entry; must include 'address', 'namespace', 'type', and 'status'.", style="warning")
+                                            continue
+                                        ns_name = ip_obj.get("namespace")
+                                        ns_id = namespaces_lookup.get(ns_name)
+                                        if not ns_id:
+                                            console.log(f"Namespace '{ns_name}' not found; skipping ip-address {ip_obj.get('address')}.", style="error")
+                                            continue
+                                        ip_type = ip_obj.get("type").lower() if ip_obj.get("type") else None
+                                        ip_status_id = statuses_lookup.get(ip_obj.get("status"))
+                                        if not ip_status_id:
+                                            console.log(f"Status '{ip_obj.get('status')}' not found; skipping ip-address {ip_obj.get('address')}.", style="error")
+                                            continue
+                                        ip_payload = {
+                                            "address": ip_obj.get("address"),
+                                            "namespace": {"id": ns_id},
+                                            "type": ip_type,
+                                            "status": {"id": ip_status_id},
+                                        }
+                                        try:
+                                            ip_result = nautobot_client.http_call(method="post", url="/api/ipam/ip-addresses/", json_data=ip_payload)
+                                            ip_id = ip_result.get("id")
+                                            if not ip_id:
+                                                console.log(f"Failed to create IP Address for {ip_obj.get('address')}", style="error")
+                                                continue
+                                            mapping_payload = {"ip_address": {"id": ip_id}, "interface": {"id": iface_result.get("id")}}
+                                            nautobot_client.http_call(method="post", url="/api/ipam/ip-address-to-interface/", json_data=mapping_payload)
+                                            console.log(f"Assigned IP {ip_obj.get('address')} to interface {interface.get('name')}", style="success")
+                                            # If this IP matches the device's primary_ip4, record its ID.
+                                            if primary_ip_address and ip_obj.get("address") == primary_ip_address:
+                                                primary_ip_id = ip_id
+                                        except Exception as e:
+                                            console.log(f"Error creating IP address mapping for {ip_obj.get('address')}: {e}", style="error")
+                            except Exception as e:
+                                console.log(f"Error importing interface '{payload_iface.get('name')}': {e}", style="error")
+                    # After processing interfaces, if a primary_ip was specified and found, update the device.
+                    if primary_ip_address and primary_ip_id:
+                        try:
+                            patch_payload = {"primary_ip4": {"id": primary_ip_id}}
+                            patch_result = nautobot_client.http_call(method="patch", url=f"/api/dcim/devices/{result.get('id')}/", json_data=patch_payload)
+                            console.log(f"Updated Device: {display_val} with primary IP {primary_ip_address}", style="success")
+                        except Exception as e:
+                            console.log(f"Error updating primary IP for device '{display_val}': {e}", style="error")
                 except Exception as e:
                     console.log(f"Error importing device '{payload.get('name')}': {e}", style="error")
     console.log("Sync process completed.", style="warning")
@@ -433,8 +535,11 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
 # =============================
 def delete_all_data(nautobot_token: str, nautobot_url: str = "http://localhost:8080"):
     nautobot_client = NautobotClient(url=nautobot_url, token=nautobot_token)
+    # Deletion order: Devices → IP Addresses → Prefixes → Device Types & Locations → Independent objects.
     deletion_order = [
         {"endpoint": "/api/dcim/devices/", "object_type": "Devices"},
+        {"endpoint": "/api/ipam/ip-addresses/", "object_type": "IP Addresses"},
+        {"endpoint": "/api/ipam/prefixes/", "object_type": "Prefixes"},
         {"endpoint": "/api/dcim/device-types/", "object_type": "Device Types"},
         {"endpoint": "/api/dcim/locations/", "object_type": "Locations"},
         {"endpoint": "/api/extras/roles/", "object_type": "Roles"},
@@ -452,33 +557,34 @@ def delete_all_data(nautobot_token: str, nautobot_url: str = "http://localhost:8
             console.log(f"Error retrieving {obj_type} for deletion: {e}", style="error")
             continue
         for obj in objects:
+            name = obj.get("name") or obj.get("model") or obj.get("prefix") or obj.get("host")
             obj_id = obj.get("id")
-            name = obj.get("name") or obj.get("model")
             if obj_id:
                 delete_url = f"{ep}{obj_id}/"
                 try:
                     nautobot_client.http_call(method="delete", url=delete_url)
-                    console.log(f"Deleted {obj_type[:-1]}: {name}", style="success")
+                    label = "IP Address" if obj_type == "IP Addresses" else ("Prefix" if obj_type == "Prefixes" else obj_type)
+                    console.log(f"Deleted {label}: {name}", style="success")
                 except Exception as e:
-                    console.log(f"Error deleting {obj_type[:-1]} '{name}': {e}", style="error")
+                    console.log(f"Error deleting {obj_type if obj_type != 'Prefixes' else 'Prefix'} '{name}': {e}", style="error")
     console.log("Deletion process completed.", style="warning")
 
 # =============================
 # Streamlit App UI
 # =============================
-st.title("Nautobot Objects Importer, Comparator, and Deleter")
+st.title("NautobotCD GitOps Tool")
 
 st.markdown(
     """
 Provide your Nautobot credentials, a Git repository URL (ending with `.git`), and the relative directory path within that repository 
 where your Nautobot YAML object files are located.
 
-- **Compare and Check Files:** Verify the presence of required YAML files and compare the objects with those already in Nautobot.
-- **Sync Nautobot Data:** Import all objects in dependency order:
-    1. Independent objects: Roles, Manufacturers, Location Types, Statuses.
-    2. Dependent objects: Device Types (dependent on Manufacturers), Locations (dependent on Location Types), then Devices (dependent on Role, Status, Location, and Device Type).
+- **Sync with Git:** Verify the presence of required YAML files and compare the objects with those already in Nautobot.
+- **Deploy to Nautobot:** Import all objects in dependency order:
+    1. Independent objects: Roles, Manufacturers, Location Types, Statuses, Prefixes.
+    2. Dependent objects: Device Types (dependent on Manufacturers), Locations (dependent on Location Types), then Devices (dependent on Role, Status, Location, and Device Type; may include interfaces with optional mgmt_only, and IP addresses with assignment as primary IP).
 - **Delete All Data:** Permanently delete all objects from Nautobot in the following order:
-    Devices → Device Types & Locations → Roles, Manufacturers, Location Types, Statuses.
+    Devices → IP Addresses → Prefixes → Device Types & Locations → Roles, Manufacturers, Location Types, Statuses.
 """
 )
 
@@ -487,7 +593,7 @@ nautobot_url = st.text_input("Enter Nautobot URL", value="http://localhost:8080"
 git_repo_url = st.text_input("Enter Git Repository URL (ending with .git)")
 subdirectory = st.text_input("Enter directory path within the repo (e.g., 'nautobot/objects')")
 
-if st.button("Compare and Check Files"):
+if st.button("Sync with Git"):
     if not nautobot_token:
         st.error("Please enter your Nautobot Token.")
     elif not git_repo_url:
@@ -506,7 +612,7 @@ if st.session_state.get("check_done", False):
             font-weight: bold;
         }
     """):
-        if st.button("Sync Nautobot Data"):
+        if st.button("Deploy to Nautobot"):
             if not nautobot_token:
                 st.error("Please enter your Nautobot Token.")
             elif not git_repo_url:
@@ -521,7 +627,7 @@ if st.session_state.get("check_done", False):
                 except Exception as e:
                     st.error(f"An error occurred during sync: {e}")
 else:
-    st.info("Please run 'Compare and Check Files' first to enable syncing.")
+    st.info("Please run 'Sync with Git' first to enable deployment.")
 
 with stylable_container("red", css_styles="""
     button {
@@ -545,8 +651,3 @@ if st.session_state.get("delete_confirm", False):
             st.session_state.delete_confirm = False
         except Exception as e:
             st.error(f"An error occurred during deletion: {e}")
-
-
-
-
-

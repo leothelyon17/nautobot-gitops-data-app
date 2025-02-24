@@ -1,3 +1,4 @@
 ---
 - name: Arista
 - name: Cisco
+- name: Juniper

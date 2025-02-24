@@ -4,4 +4,6 @@
     - dcim.device
     - dcim.location
     - dcim.interface
+    - ipam.ipaddress
+    - ipam.prefix
   color: 4caf50

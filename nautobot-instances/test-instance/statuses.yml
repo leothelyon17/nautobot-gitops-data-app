@@ -3,4 +3,5 @@
   content_types:
     - dcim.device
     - dcim.location
+    - dcim.interface
   color: 4caf50

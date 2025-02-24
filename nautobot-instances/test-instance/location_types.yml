@@ -1,0 +1,4 @@
+---
+- name: lab
+  content_types:
+    - dcim.devices

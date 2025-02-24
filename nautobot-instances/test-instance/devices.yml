@@ -8,6 +8,7 @@
     - name: mgmt0
       type: 1000base-t
       status: Active
+      mgmt_only: true
       ip-address:
         - address: 10.10.10.10/24
           namespace: Global

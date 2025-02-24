@@ -2,5 +2,5 @@
 - name: Active
   content_types:
     - dcim.device
-      dcim.location
+    - dcim.location
   color: 4caf50

@@ -1,0 +1,17 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hashi-vault-lab
+  namespace: argocd
+spec:
+  project: home-lab
+  source:
+    repoURL: https://github.com/leothelyon17/streamlit-nautobot-argo-app.git
+    path: manifests
+    targetRevision: HEAD
+  destination:
+    server: https://172.16.99.25:6443
+    namespace: streamlit-nautobot-argo-app
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

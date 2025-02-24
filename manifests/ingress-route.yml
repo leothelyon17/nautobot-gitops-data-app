@@ -1,0 +1,21 @@
+---
+# --> (Example) Create an IngressRoute for your service...
+ apiVersion: traefik.io/v1alpha1
+ kind: IngressRoute
+ metadata:
+   name: streamlit-nautobot-argo-app-ingressroute  # <-- Replace with your IngressRoute name
+   namespace: streamlit-nautobot-argo-app  # <-- Replace with your namespace
+ spec:
+   entryPoints:
+     - web
+     - websecure
+   routes:
+     - match: Host(`streamlit-nautobot-argo-app.nerdy-apps-lab.jjland.local`)  # <-- Replace with your FQDN
+       kind: Rule
+       services:
+         - name: streamlit-service  # <-- Replace with your service name
+           port: 80
+# --> (Optional) Add certificate secret
+# tls:
+#     secretName: your-certificate-secret
+# <--

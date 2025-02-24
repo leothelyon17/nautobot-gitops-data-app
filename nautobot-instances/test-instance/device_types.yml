@@ -1,5 +1,5 @@
 ---
 
-- model: Test 123,
+- model_name: Test 123,
   manufacturer: Arista,
-  u_height: 1
+  height: 1

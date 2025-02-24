@@ -1,4 +1,4 @@
-#NautobotCD GitOps Tool
+NautobotCD GitOps Tool
 
 The NautobotCD GitOps Tool is a Streamlit-based application designed to synchronize and deploy Nautobot objects from YAML files stored in a Git repository. It supports importing a wide variety of Nautobot object types—including roles, manufacturers, device types, locations, location types, statuses, prefixes, and devices (with interfaces and IP addresses)—directly into your Nautobot instance via its REST API.
 

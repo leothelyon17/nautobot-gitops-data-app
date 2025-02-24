@@ -9,7 +9,7 @@
       type: 1000base-t
       status: Active
       ip-address:
-        - address: 10.10.10.10.24
+        - address: 10.10.10.10/24
           namespace: Global
           type: Host
           status: Active

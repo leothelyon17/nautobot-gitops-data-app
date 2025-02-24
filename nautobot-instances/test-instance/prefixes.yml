@@ -1,0 +1,5 @@
+---
+- prefix: 10.10.10.0/24
+  namespace: Global
+  type: Network
+  status: Active

@@ -1,1 +1,4 @@
 *venv
+# Ignore Python cache directories and compiled files
+__pycache__/
+*.pyc

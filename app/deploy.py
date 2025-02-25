@@ -6,8 +6,14 @@ from nautobot_client import NautobotClient
 from logger import console
 
 def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirectory: str,
-                              nautobot_url: str = "http://localhost:8080"):
+                              nautobot_url: str = "http://localhost:8080", username: str = None, token: str = None):
     console.log(f"Cloning repository: {git_repo_url}", style="info")
+    # If authentication credentials are provided, insert them into the URL.
+    if username and token:
+        if git_repo_url.startswith("https://"):
+            git_repo_url = git_repo_url.replace("https://", f"https://{username}:{token}@")
+        elif git_repo_url.startswith("http://"):
+            git_repo_url = git_repo_url.replace("http://", f"http://{username}:{token}@")
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
             git.Repo.clone_from(git_repo_url, temp_dir)
@@ -38,9 +44,10 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                     namespaces_lookup[ns["name"]] = ns.get("id")
         except Exception as e:
             console.log(f"Error retrieving namespaces: {e}", style="error")
+        repo_dir = os.path.join(temp_dir, subdirectory.strip("/"))
         # Process independent objects.
         for filename, info in independent_files.items():
-            file_path = os.path.join(temp_dir, subdirectory.strip("/"), filename)
+            file_path = os.path.join(repo_dir, filename)
             if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
                 console.log(f"{filename} not found or empty; skipping.", style="warning")
                 continue
@@ -126,7 +133,7 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
         for filename, info in dependent_files.items():
             if filename != "device_types.yml":
                 continue
-            file_path = os.path.join(temp_dir, subdirectory.strip("/"), filename)
+            file_path = os.path.join(repo_dir, filename)
             if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
                 console.log(f"{filename} not found or empty; skipping.", style="warning")
                 continue
@@ -177,11 +184,15 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
         except Exception as e:
             console.log(f"Error retrieving device types: {e}", style="error")
             device_types_lookup = {}
+        
+        # ----- Process Interface Templates -----
+        process_interface_templates(nautobot_client, repo_dir, "interface_templates.yml", device_types_lookup)
+        
         # Process dependent objects: Locations.
         for filename, info in dependent_files.items():
             if filename != "locations.yml":
                 continue
-            file_path = os.path.join(temp_dir, subdirectory.strip("/"), filename)
+            file_path = os.path.join(repo_dir, filename)
             if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
                 console.log(f"{filename} not found or empty; skipping.", style="warning")
                 continue
@@ -237,7 +248,7 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
         for filename, info in dependent_files.items():
             if filename != "devices.yml":
                 continue
-            file_path = os.path.join(temp_dir, subdirectory.strip("/"), filename)
+            file_path = os.path.join(repo_dir, filename)
             if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
                 console.log(f"{filename} not found or empty; skipping.", style="warning")
                 continue
@@ -281,7 +292,7 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                     if update_payload:
                         try:
                             patch_url = f"/api/dcim/devices/{existing_devices[device_name].get('id')}/"
-                            patch_result = nautobot_client.http_call(method="patch", url=patch_url, json_data=update_payload)
+                            _ = nautobot_client.http_call(method="patch", url=patch_url, json_data=update_payload)
                             console.log(f"Updated Device: {device_name}", style="success")
                         except Exception as e:
                             console.log(f"Error updating device '{device_name}': {e}", style="error")
@@ -329,7 +340,7 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                     if iface_name in existing_ifaces:
                         existing_iface = existing_ifaces[iface_name]
                         needs_update = False
-                        # Compare the interface type value in lowercase.
+                        # Compare only the interface type value in lowercase.
                         existing_type = existing_iface.get("type")
                         if isinstance(existing_type, dict):
                             existing_type_value = existing_type.get("value", "").lower()
@@ -340,23 +351,18 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                             needs_update = True
                         if existing_iface.get("status", {}).get("id") != payload_iface.get("status", {}).get("id"):
                             needs_update = True
-                        if "mgmt_only" in payload_iface:
-                            if existing_iface.get("mgmt_only") != payload_iface.get("mgmt_only"):
-                                needs_update = True
-                        # Continue with the update if needed.
+                        if "mgmt_only" in payload_iface and existing_iface.get("mgmt_only") != payload_iface.get("mgmt_only"):
+                            needs_update = True
                         if needs_update:
                             try:
                                 patch_url = f"/api/dcim/interfaces/{existing_iface.get('id')}/"
-                                patch_result = nautobot_client.http_call(method="patch", url=patch_url, json_data=payload_iface)
-                                console.log(f"Updated Interface: {patch_result.get('display') or iface_name} on device {device_name}", style="success")
-                                iface_result = patch_result
+                                iface_result = nautobot_client.http_call(method="patch", url=patch_url, json_data=payload_iface)
+                                console.log(f"Updated Interface: {iface_result.get('display') or iface_name} on device {device_name}", style="success")
                             except Exception as e:
                                 console.log(f"Error updating interface '{iface_name}': {e}", style="error")
                                 continue
                         else:
-                            console.log(f"Interface {iface_name} on device {device_name} is already up-to-date", style="info")
                             iface_result = existing_iface
-
                     else:
                         try:
                             iface_result = nautobot_client.http_call(method="post", url="/api/dcim/interfaces/", json_data=payload_iface)
@@ -364,16 +370,12 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                         except Exception as e:
                             console.log(f"Error importing interface '{iface_name}': {e}", style="error")
                             continue
-                    # Process IP addresses for this interface.
+                    # Process IP address mappings.
                     try:
-                        existing_ips_response = nautobot_client.http_call(
-                            method="get", 
-                            url=f"/api/ipam/ip-addresses/?interface={iface_result.get('id')}"
-                        )
+                        existing_ips_response = nautobot_client.http_call(method="get", url=f"/api/ipam/ip-addresses/?interface={iface_result.get('id')}")
                         existing_ips = {ip["address"]: ip for ip in existing_ips_response.get("results", []) if "address" in ip}
                     except Exception:
                         existing_ips = {}
-
                     if "ip-address" in interface and isinstance(interface["ip-address"], list):
                         for ip_obj in interface["ip-address"]:
                             if not isinstance(ip_obj, dict) or not ip_obj.get("address"):
@@ -383,14 +385,11 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                                 console.log("Skipping invalid ip-address entry.", style="warning")
                                 continue
                             ip_address = ip_obj.get("address")
-                            # If the IP is already assigned to the interface, skip mapping.
                             if ip_address in existing_ips:
                                 console.log(f"IP Address {ip_address} already exists on interface {iface_result.get('id')} for device {device_name}; skipping mapping.", style="info")
                                 if primary_ip_address and ip_address == primary_ip_address:
                                     primary_ip_id = existing_ips[ip_address].get("id")
                                 continue
-
-                            # Check if mapping already exists.
                             try:
                                 mapping_search = nautobot_client.http_call(
                                     method="get",
@@ -399,12 +398,10 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                                 if mapping_search.get("results"):
                                     console.log(f"Mapping for IP {ip_address} already exists on interface {iface_result.get('id')}; skipping mapping.", style="info")
                                     if primary_ip_address and ip_address == primary_ip_address:
-                                        primary_ip_id = mapping_search["results"][0].get("ip_address")
+                                        primary_ip_id = mapping_search["results"][0].get("ip_address", {}).get("id")
                                     continue
                             except Exception:
                                 pass
-
-                            # (Existing logic for checking globally if the IP exists and creating mapping or IP if necessary)
                             try:
                                 ip_search_response = nautobot_client.http_call(method="get", url=f"/api/ipam/ip-addresses/?address={ip_address}")
                                 ip_search_results = ip_search_response.get("results", [])
@@ -412,25 +409,23 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                                 ip_search_results = []
                             if ip_search_results:
                                 ip_id = ip_search_results[0].get("id")
-                                # Build mapping payload with plain IDs.
-                                mapping_payload = {"ip_address": ip_id, "interface": iface_result.get("id")}
+                                mapping_payload = {"ip_address": {"id": ip_id}, "interface": {"id": iface_result.get("id")}}
                                 try:
                                     mapping_check = nautobot_client.http_call(
                                         method="get",
                                         url=f"/api/ipam/ip-address-to-interface/?interface={iface_result.get('id')}&ip_address={ip_id}"
                                     )
                                     if mapping_check.get("results"):
-                                        console.log(f"Mapping for IP {ip_address} already exists on interface {iface_result.get('id')}; skipping mapping.", style="info")
+                                        if primary_ip_address and ip_address == primary_ip_address:
+                                            primary_ip_id = ip_id
                                     else:
                                         nautobot_client.http_call(method="post", url="/api/ipam/ip-address-to-interface/", json_data=mapping_payload)
                                         console.log(f"Applied mapping for IP {ip_address} to interface {iface_result.get('id')} on device {device_name}", style="success")
                                         if primary_ip_address and ip_address == primary_ip_address:
                                             primary_ip_id = ip_id
                                 except Exception as e:
-                                    console.log(f"Error checking/applying mapping for IP {ip_address}: {e}", style="error")
+                                    console.log(f"Error applying mapping for IP {ip_address}: {e}", style="error")
                                 continue
-
-                            # If IP not found globally, create it.
                             ns_name = ip_obj.get("namespace")
                             ns_id = namespaces_lookup.get(ns_name)
                             if not ns_id:
@@ -454,21 +449,107 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                                     console.log(f"Failed to create IP Address for {ip_address}", style="error")
                                     continue
                                 console.log(f"Created IP Address {ip_address}", style="success")
-                                mapping_payload = {"ip_address": ip_id, "interface": iface_result.get("id")}
+                                mapping_payload = {"ip_address": {"id": ip_id}, "interface": {"id": iface_result.get("id")}}
                                 nautobot_client.http_call(method="post", url="/api/ipam/ip-address-to-interface/", json_data=mapping_payload)
                                 console.log(f"Applied IP address {ip_address} to interface {iface_result.get('id')} on device {device_name}", style="success")
                                 if primary_ip_address and ip_address == primary_ip_address:
                                     primary_ip_id = ip_id
                             except Exception as e:
                                 console.log(f"Error creating IP address mapping for {ip_address}: {e}", style="error")
-
                 if primary_ip_address and primary_ip_id:
-                    try:
-                        patch_payload = {"primary_ip4": {"id": primary_ip_id}}
-                        device_id_to_patch = existing_devices[device_name].get("id") if device_name in existing_devices else result.get("id")
-                        patch_result = nautobot_client.http_call(method="patch", url=f"/api/dcim/devices/{device_id_to_patch}/", json_data=patch_payload)
-                        console.log(f"Updated Device: {device_name} with primary IP {primary_ip_address}", style="success")
-                    except Exception as e:
-                        console.log(f"Error updating primary IP for device '{device_name}': {e}", style="error")
-    console.log("Sync process completed.", style="warning")
+                    # Only update if the current primary IP does not match the desired one.
+                    current_primary = None
+                    if device_name in existing_devices:
+                        # Assuming the device's primary_ip4 field is a dict with an "id" key.
+                        current_primary = existing_devices[device_name].get("primary_ip4", {}).get("id")
+                    # If the current primary IP is different from what we want, update it.
+                    if current_primary != primary_ip_id:
+                        try:
+                            patch_payload = {"primary_ip4": {"id": primary_ip_id}}
+                            device_id_to_patch = existing_devices[device_name].get("id") if device_name in existing_devices else result.get("id")
+                            _ = nautobot_client.http_call(method="patch", url=f"/api/dcim/devices/{device_id_to_patch}/", json_data=patch_payload)
+                            console.log(f"Updated Device: {device_name} with primary IP {primary_ip_address}", style="success")
+                        except Exception as e:
+                            console.log(f"Error updating primary IP for device '{device_name}': {e}", style="error")
+
+        console.log("Sync process completed.", style="warning")
+
+# -------------------------------
+# New: Process Interface Templates
+# -------------------------------
+def process_interface_templates(nautobot_client: NautobotClient, repo_dir: str, filename: str, device_types_lookup: dict):
+    """
+    Process interface templates from a YAML file with the following format:
+    
+    - Test 123:
+        - name: test0
+          type: virtual
+          mgmt_only: true
+        - name: test1
+          type: virtual
+
+    The key is the device type name. For each interface template, we check via a GET call
+    if a template with the same name exists for the given device type. If it exists, we do nothing.
+    """
+    import os, yaml
+    file_path = os.path.join(repo_dir, filename)
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        console.log(f"{filename} not found or empty; skipping interface templates.", style="warning")
+        return
+    try:
+        with open(file_path, "r") as f:
+            data_list = yaml.safe_load(f)
+    except Exception as e:
+        console.log(f"Error reading {filename}: {e}", style="error")
+        return
+    if not isinstance(data_list, list):
+        console.log(f"{filename} does not contain a list; skipping interface templates.", style="warning")
+        return
+    console.log(f"Processing interface templates from {filename}.", style="info")
+    for entry in data_list:
+        # Each entry should be a dict with exactly one key: the device type name.
+        if not isinstance(entry, dict) or len(entry) != 1:
+            console.log("Invalid interface template entry format; skipping.", style="warning")
+            continue
+        device_type_name, templates = list(entry.items())[0]
+        device_type_id = device_types_lookup.get(device_type_name)
+        if not device_type_id:
+            console.log(f"Device type '{device_type_name}' not found; skipping interface templates for this device type.", style="error")
+            continue
+        if not isinstance(templates, list):
+            console.log(f"Interface templates for device type '{device_type_name}' are not in list format; skipping.", style="warning")
+            continue
+        for template in templates:
+            template_name = template.get("name")
+            if not template_name:
+                console.log("Interface template missing name; skipping.", style="warning")
+                continue
+            # Use query parameter 'device_type' to check for existing templates.
+            get_url = f"/api/dcim/interface-templates/?device_type={device_type_id}&name={template_name}"
+            try:
+                resp = nautobot_client.http_call(method="get", url=get_url)
+                results = resp.get("results", [])
+            except Exception as e:
+                console.log(f"Error retrieving interface template '{template_name}': {e}", style="error")
+                results = []
+            if results:
+                continue
+            payload = {
+                "name": template_name,
+                "type": template.get("type").lower() if template.get("type") else None,
+                "mgmt_only": template.get("mgmt_only", False),
+                "device_type": {"id": device_type_id}
+            }
+            try:
+                result = nautobot_client.http_call(method="post", url="/api/dcim/interface-templates/", json_data=payload)
+                console.log(f"Created Interface: {result.get('display') or template_name} for device type '{device_type_name}'", style="success")
+            except Exception as e:
+                console.log(f"Error creating interface template '{template_name}': {e}", style="error")
+
+
+
+# -------------------------------
+# End of deploy functions
+# -------------------------------
+
 

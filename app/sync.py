@@ -8,7 +8,14 @@ from nautobot_client import NautobotClient
 from logger import console
 
 def check_and_compare_objects(nautobot_token: str, git_repo_url: str, subdirectory: str,
-                              nautobot_url: str = "http://localhost:8080"):
+                              nautobot_url: str = "http://localhost:8080", username: str = None, token: str = None):
+    # If authentication credentials are provided, inject them into the repo URL.
+    if username and token:
+        if git_repo_url.startswith("https://"):
+            git_repo_url = git_repo_url.replace("https://", f"https://{username}:{token}@")
+        elif git_repo_url.startswith("http://"):
+            git_repo_url = git_repo_url.replace("http://", f"http://{username}:{token}@")
+            
     required_files = {
         "manufacturers.yml": {"endpoint": "/api/dcim/manufacturers/?limit=0", "object_type": "Manufacturers", "compare_key": "name"},
         "device_types.yml": {"endpoint": "/api/dcim/device-types/?limit=0", "object_type": "Device Types", "compare_key": "model"},
@@ -73,5 +80,6 @@ def check_and_compare_objects(nautobot_token: str, git_repo_url: str, subdirecto
             st.info("None")
     st.session_state.check_done = True
     return compare_results
+
 
 

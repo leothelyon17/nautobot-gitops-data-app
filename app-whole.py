@@ -225,7 +225,7 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                     ns_name = obj.get("namespace")
                     ns_id = namespaces_lookup.get(ns_name)
                     if not ns_id:
-                        console.log(f"Namespace '{ns_name}' not found; skipping prefix {obj.get('prefix')}.", style="error")
+                        console.log(f"Namespace '{ns_name}' not found; skipping prefix {obj.get('prefix')}.", style="warning")
                         continue
                     prefix_type = obj.get("type")
                     if prefix_type:
@@ -239,7 +239,7 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
                         console.log(f"Error retrieving statuses for prefix lookup: {e}", style="error")
                         status_id = None
                     if not status_id:
-                        console.log(f"Status '{obj.get('status')}' not found; skipping prefix {obj.get('prefix')}.", style="error")
+                        console.log(f"Status '{obj.get('status')}' not found; skipping prefix {obj.get('prefix')}.", style="warning")
                         continue
                     payload = {"prefix": obj.get("prefix"), "namespace": {"id": ns_id}, "type": prefix_type, "status": {"id": status_id}}
                 else:
@@ -407,127 +407,198 @@ def sync_all_objects_from_git(nautobot_token: str, git_repo_url: str, subdirecto
             try:
                 existing_resp = nautobot_client.http_call(method="get", url=info["endpoint"] + "?limit=0")
                 existing_objs = existing_resp.get("results", [])
+                existing_devices = {obj.get(info["compare_key"]): obj for obj in existing_objs if obj.get(info["compare_key"])}
             except Exception as e:
                 console.log(f"Error fetching existing {info['object_type']} for duplicate check: {e}", style="error")
-                existing_objs = []
-            existing_set = {obj.get(info["compare_key"]) for obj in existing_objs if obj.get(info["compare_key"])}
-            console.log(f"Processing {len(data_list)} object(s) in {filename}.", style="info")
+                existing_devices = {}
+            console.log(f"Processing {len(data_list)} device(s) in {filename}.", style="info")
             for obj in data_list:
                 if not isinstance(obj, dict) or not obj.get(info["compare_key"]):
                     continue
-                if obj.get(info["compare_key"]) in existing_set:
-                    continue
-                if info["special"] == "devices":
-                    if not all(k in obj for k in ["name", "role", "status", "location", "device-type"]):
-                        console.log("Skipping invalid device entry; must include 'name', 'role', 'status', 'location', and 'device-type'.", style="warning")
-                        continue
-                    role_id = roles_lookup.get(obj.get("role"))
-                    status_id = statuses_lookup.get(obj.get("status"))
-                    location_id = locations_lookup.get(obj.get("location"))
-                    device_type_id = device_types_lookup.get(obj.get("device-type"))
-                    if not role_id:
-                        console.log(f"Device role '{obj.get('role')}' not found; skipping device {obj.get('name')}.", style="error")
-                        continue
-                    if not status_id:
-                        console.log(f"Status '{obj.get('status')}' not found; skipping device {obj.get('name')}.", style="error")
-                        continue
-                    if not location_id:
-                        console.log(f"Location '{obj.get('location')}' not found; skipping device {obj.get('name')}.", style="error")
-                        continue
-                    if not device_type_id:
-                        console.log(f"Device type '{obj.get('device-type')}' not found; skipping device {obj.get('name')}.", style="error")
-                        continue
-                    # Capture primary_ip4 if provided.
-                    primary_ip_address = obj.get("primary_ip4")
-                    primary_ip_id = None
+                device_name = obj.get("name")
+                primary_ip_address = obj.get("primary_ip4")
+                primary_ip_id = None
+                # If device exists, update only if needed.
+                if device_name in existing_devices:
+                    update_payload = {}
+                    new_role = roles_lookup.get(obj.get("role"))
+                    if new_role and existing_devices[device_name].get("role", {}).get("id") != new_role:
+                        update_payload["role"] = {"id": new_role}
+                    new_status = statuses_lookup.get(obj.get("status"))
+                    if new_status and existing_devices[device_name].get("status", {}).get("id") != new_status:
+                        update_payload["status"] = {"id": new_status}
+                    new_location = locations_lookup.get(obj.get("location"))
+                    if new_location and existing_devices[device_name].get("location", {}).get("id") != new_location:
+                        update_payload["location"] = {"id": new_location}
+                    new_device_type = device_types_lookup.get(obj.get("device-type"))
+                    if new_device_type and existing_devices[device_name].get("device_type", {}).get("id") != new_device_type:
+                        update_payload["device_type"] = {"id": new_device_type}
+                    if update_payload:
+                        try:
+                            patch_url = f"/api/dcim/devices/{existing_devices[device_name].get('id')}/"
+                            patch_result = nautobot_client.http_call(method="patch", url=patch_url, json_data=update_payload)
+                            console.log(f"Updated Device: {device_name}", style="success")
+                        except Exception as e:
+                            console.log(f"Error updating device '{device_name}': {e}", style="error")
+                    else:
+                        console.log(f"Device {device_name} is already up-to-date", style="info")
+                    device_id = existing_devices[device_name].get("id")
+                else:
                     payload = {
                         "name": obj.get("name"),
-                        "role": {"id": role_id},
-                        "status": {"id": status_id},
-                        "location": {"id": location_id},
-                        "device_type": {"id": device_type_id},
+                        "role": {"id": roles_lookup.get(obj.get("role"))},
+                        "status": {"id": statuses_lookup.get(obj.get("status"))},
+                        "location": {"id": locations_lookup.get(obj.get("location"))},
+                        "device_type": {"id": device_types_lookup.get(obj.get("device-type"))},
                     }
-                    interfaces = obj.get("interfaces") if isinstance(obj.get("interfaces"), list) else []
-                else:
-                    payload = obj
-                try:
-                    result = nautobot_client.http_call(method="post", url=info["endpoint"], json_data=payload)
-                    display_val = result.get("display") or payload.get("name")
-                    console.log(f"Imported Device: {display_val}", style="success")
-                    # Process interfaces if present.
-                    if info["special"] == "devices" and interfaces:
+                    try:
+                        result = nautobot_client.http_call(method="post", url=info["endpoint"], json_data=payload)
+                        console.log(f"Imported Device: {result.get('display') or payload.get('name')}", style="success")
                         device_id = result.get("id")
-                        for interface in interfaces:
-                            if not isinstance(interface, dict) or "name" not in interface or "status" not in interface:
-                                console.log("Skipping invalid interface entry; must include 'name' and 'status'.", style="warning")
-                                continue
-                            iface_status_id = statuses_lookup.get(interface["status"])
-                            if not iface_status_id:
-                                console.log(f"Interface status '{interface['status']}' not found; skipping interface {interface.get('name')}.", style="error")
-                                continue
-                            payload_iface = {
-                                "device": {"id": device_id},
-                                "name": interface.get("name"),
-                                "type": interface.get("type"),
-                                "status": {"id": iface_status_id},
-                            }
-                            if interface.get("mgmt_only") is True:
-                                payload_iface["mgmt_only"] = True
-                            try:
-                                iface_result = nautobot_client.http_call(method="post", url="/api/dcim/interfaces/", json_data=payload_iface)
-                                iface_display = iface_result.get("display") or payload_iface.get("name")
-                                console.log(f"Imported Interface: {iface_display}", style="success")
-                                # Process IP addresses for this interface.
-                                if "ip-address" in interface and isinstance(interface["ip-address"], list):
-                                    for ip_obj in interface["ip-address"]:
-                                        if not isinstance(ip_obj, dict) or not ip_obj.get("address"):
-                                            console.log("Skipping invalid ip-address entry; must include 'address'.", style="warning")
-                                            continue
-                                        if not all(k in ip_obj for k in ["address", "namespace", "type", "status"]):
-                                            console.log("Skipping invalid ip-address entry; must include 'address', 'namespace', 'type', and 'status'.", style="warning")
-                                            continue
-                                        ns_name = ip_obj.get("namespace")
-                                        ns_id = namespaces_lookup.get(ns_name)
-                                        if not ns_id:
-                                            console.log(f"Namespace '{ns_name}' not found; skipping ip-address {ip_obj.get('address')}.", style="error")
-                                            continue
-                                        ip_type = ip_obj.get("type").lower() if ip_obj.get("type") else None
-                                        ip_status_id = statuses_lookup.get(ip_obj.get("status"))
-                                        if not ip_status_id:
-                                            console.log(f"Status '{ip_obj.get('status')}' not found; skipping ip-address {ip_obj.get('address')}.", style="error")
-                                            continue
-                                        ip_payload = {
-                                            "address": ip_obj.get("address"),
-                                            "namespace": {"id": ns_id},
-                                            "type": ip_type,
-                                            "status": {"id": ip_status_id},
-                                        }
-                                        try:
-                                            ip_result = nautobot_client.http_call(method="post", url="/api/ipam/ip-addresses/", json_data=ip_payload)
-                                            ip_id = ip_result.get("id")
-                                            if not ip_id:
-                                                console.log(f"Failed to create IP Address for {ip_obj.get('address')}", style="error")
-                                                continue
-                                            mapping_payload = {"ip_address": {"id": ip_id}, "interface": {"id": iface_result.get("id")}}
-                                            nautobot_client.http_call(method="post", url="/api/ipam/ip-address-to-interface/", json_data=mapping_payload)
-                                            console.log(f"Assigned IP {ip_obj.get('address')} to interface {interface.get('name')}", style="success")
-                                            # If this IP matches the device's primary_ip4, record its ID.
-                                            if primary_ip_address and ip_obj.get("address") == primary_ip_address:
-                                                primary_ip_id = ip_id
-                                        except Exception as e:
-                                            console.log(f"Error creating IP address mapping for {ip_obj.get('address')}: {e}", style="error")
-                            except Exception as e:
-                                console.log(f"Error importing interface '{payload_iface.get('name')}': {e}", style="error")
-                    # After processing interfaces, if a primary_ip was specified and found, update the device.
-                    if primary_ip_address and primary_ip_id:
-                        try:
-                            patch_payload = {"primary_ip4": {"id": primary_ip_id}}
-                            patch_result = nautobot_client.http_call(method="patch", url=f"/api/dcim/devices/{result.get('id')}/", json_data=patch_payload)
-                            console.log(f"Updated Device: {display_val} with primary IP {primary_ip_address}", style="success")
-                        except Exception as e:
-                            console.log(f"Error updating primary IP for device '{display_val}': {e}", style="error")
+                    except Exception as e:
+                        console.log(f"Error importing device '{payload.get('name')}': {e}", style="error")
+                        continue
+                # Process interfaces for device.
+                try:
+                    existing_ifaces_response = nautobot_client.http_call(method="get", url=f"/api/dcim/interfaces/?device={device_id}")
+                    existing_ifaces = {iface["name"]: iface for iface in existing_ifaces_response.get("results", []) if "name" in iface}
                 except Exception as e:
-                    console.log(f"Error importing device '{payload.get('name')}': {e}", style="error")
+                    existing_ifaces = {}
+                interfaces = obj.get("interfaces") if isinstance(obj.get("interfaces"), list) else []
+                for interface in interfaces:
+                    if not isinstance(interface, dict) or "name" not in interface or "status" not in interface:
+                        console.log("Skipping invalid interface entry; must include 'name' and 'status'.", style="warning")
+                        continue
+                    iface_name = interface.get("name")
+                    iface_status_id = statuses_lookup.get(interface["status"])
+                    if not iface_status_id:
+                        console.log(f"Interface status '{interface['status']}' not found; skipping interface {iface_name}.", style="error")
+                        continue
+                    payload_iface = {
+                        "device": {"id": device_id},
+                        "name": iface_name,
+                        "type": interface.get("type"),
+                        "status": {"id": iface_status_id},
+                    }
+                    if interface.get("mgmt_only") is True:
+                        payload_iface["mgmt_only"] = True
+                    if iface_name in existing_ifaces:
+                        existing_iface = existing_ifaces[iface_name]
+                        needs_update = False
+                        if existing_iface.get("type") != payload_iface.get("type"):
+                            needs_update = True
+                        if existing_iface.get("status", {}).get("id") != payload_iface.get("status", {}).get("id"):
+                            needs_update = True
+                        if "mgmt_only" in payload_iface:
+                            if existing_iface.get("mgmt_only") != payload_iface.get("mgmt_only"):
+                                needs_update = True
+                        if needs_update:
+                            try:
+                                patch_url = f"/api/dcim/interfaces/{existing_iface.get('id')}/"
+                                patch_result = nautobot_client.http_call(method="patch", url=patch_url, json_data=payload_iface)
+                                console.log(f"Updated Interface: {patch_result.get('display') or iface_name} on device {device_name}", style="success")
+                                iface_result = patch_result
+                            except Exception as e:
+                                console.log(f"Error updating interface '{iface_name}': {e}", style="error")
+                                continue
+                        else:
+                            console.log(f"Interface {iface_name} on device {device_name} is already up-to-date", style="info")
+                            iface_result = existing_iface
+                    else:
+                        try:
+                            iface_result = nautobot_client.http_call(method="post", url="/api/dcim/interfaces/", json_data=payload_iface)
+                            console.log(f"Imported Interface: {iface_result.get('display') or iface_name} on device {device_name}", style="success")
+                        except Exception as e:
+                            console.log(f"Error importing interface '{iface_name}': {e}", style="error")
+                            continue
+                    # Process IP addresses for this interface.
+                    try:
+                        existing_ips_response = nautobot_client.http_call(method="get", url=f"/api/ipam/ip-addresses/?interface={iface_result.get('id')}")
+                        existing_ips = {ip["address"]: ip for ip in existing_ips_response.get("results", []) if "address" in ip}
+                    except Exception:
+                        existing_ips = {}
+                    if "ip-address" in interface and isinstance(interface["ip-address"], list):
+                        for ip_obj in interface["ip-address"]:
+                            if not isinstance(ip_obj, dict) or not ip_obj.get("address"):
+                                console.log("Skipping invalid ip-address entry; must include 'address'.", style="warning")
+                                continue
+                            if not all(k in ip_obj for k in ["address", "namespace", "type", "status"]):
+                                console.log("Skipping invalid ip-address entry; must include 'address', 'namespace', 'type', and 'status'.", style="warning")
+                                continue
+                            ip_address = ip_obj.get("address")
+                            # Check if the IP is already assigned to the interface.
+                            if ip_address in existing_ips:
+                                console.log(f"IP Address {ip_address} already exists on interface {iface_name} for device {device_name}; skipping mapping.", style="info")
+                                if primary_ip_address and ip_address == primary_ip_address:
+                                    primary_ip_id = existing_ips[ip_address].get("id")
+                                continue
+                            # Check globally if the IP exists.
+                            try:
+                                ip_search_response = nautobot_client.http_call(method="get", url=f"/api/ipam/ip-addresses/?address={ip_address}")
+                                ip_search_results = ip_search_response.get("results", [])
+                            except Exception:
+                                ip_search_results = []
+                            if ip_search_results:
+                                ip_id = ip_search_results[0].get("id")
+                                # Check if mapping exists.
+                                try:
+                                    mapping_search = nautobot_client.http_call(method="get", url=f"/api/ipam/ip-address-to-interface/?interface={iface_result.get('id')}&ip_address={ip_address}")
+                                    if mapping_search.get("results"):
+                                        console.log(f"Mapping for IP {ip_address} already exists on interface {iface_name} for device {device_name}.", style="info")
+                                        if primary_ip_address and ip_address == primary_ip_address:
+                                            primary_ip_id = mapping_search["results"][0].get("ip_address", {}).get("id")
+                                        continue
+                                except Exception:
+                                    pass
+                                mapping_payload = {"ip_address": {"id": ip_id}, "interface": {"id": iface_result.get("id")}}
+                                try:
+                                    nautobot_client.http_call(method="post", url="/api/ipam/ip-address-to-interface/", json_data=mapping_payload)
+                                    console.log(f"Applied existing IP address {ip_address} to interface {iface_name} on device {device_name}", style="success")
+                                    if primary_ip_address and ip_address == primary_ip_address:
+                                        primary_ip_id = ip_id
+                                except Exception as e:
+                                    console.log(f"Error applying mapping for IP {ip_address}: {e}", style="error")
+                                continue
+                            # IP not found globally; create it.
+                            ns_name = ip_obj.get("namespace")
+                            ns_id = namespaces_lookup.get(ns_name)
+                            if not ns_id:
+                                console.log(f"Namespace '{ns_name}' not found; skipping ip-address {ip_address}.", style="error")
+                                continue
+                            ip_type = ip_obj.get("type").lower() if ip_obj.get("type") else None
+                            ip_status_id = statuses_lookup.get(ip_obj.get("status"))
+                            if not ip_status_id:
+                                console.log(f"Status '{ip_obj.get('status')}' not found; skipping ip-address {ip_address}.", style="error")
+                                continue
+                            ip_payload = {
+                                "address": ip_address,
+                                "namespace": {"id": ns_id},
+                                "type": ip_type,
+                                "status": {"id": ip_status_id},
+                            }
+                            try:
+                                ip_result = nautobot_client.http_call(method="post", url="/api/ipam/ip-addresses/", json_data=ip_payload)
+                                ip_id = ip_result.get("id")
+                                if not ip_id:
+                                    console.log(f"Failed to create IP Address for {ip_address}", style="error")
+                                    continue
+                                console.log(f"Created IP Address {ip_address}", style="success")
+                                mapping_payload = {"ip_address": {"id": ip_id}, "interface": {"id": iface_result.get("id")}}
+                                nautobot_client.http_call(method="post", url="/api/ipam/ip-address-to-interface/", json_data=mapping_payload)
+                                console.log(f"Applied IP address {ip_address} to interface {iface_name} on device {device_name}", style="success")
+                                if primary_ip_address and ip_address == primary_ip_address:
+                                    primary_ip_id = ip_id
+                            except Exception as e:
+                                console.log(f"Error creating IP address mapping for {ip_address}: {e}", style="error")
+                # After processing interfaces, if primary_ip4 was specified and found, update the device.
+                if primary_ip_address and primary_ip_id:
+                    try:
+                        patch_payload = {"primary_ip4": {"id": primary_ip_id}}
+                        device_id_to_patch = existing_devices[device_name].get("id") if device_name in existing_devices else result.get("id")
+                        patch_result = nautobot_client.http_call(method="patch", url=f"/api/dcim/devices/{device_id_to_patch}/", json_data=patch_payload)
+                        console.log(f"Updated Device: {device_name} with primary IP {primary_ip_address}", style="success")
+                    except Exception as e:
+                        console.log(f"Error updating primary IP for device '{device_name}': {e}", style="error")
     console.log("Sync process completed.", style="warning")
 
 # =============================
@@ -651,3 +722,4 @@ if st.session_state.get("delete_confirm", False):
             st.session_state.delete_confirm = False
         except Exception as e:
             st.error(f"An error occurred during deletion: {e}")
+

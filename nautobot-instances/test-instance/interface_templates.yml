@@ -1,0 +1,8 @@
+---
+- device-type: Test 123
+  - name: test0
+    type: virtual
+    mgmt_only: true
+  - name: test1
+    type: virtual
+  
